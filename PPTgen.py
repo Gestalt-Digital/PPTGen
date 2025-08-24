@@ -2,46 +2,59 @@
 
 # app.py
 
-import os, io, glob, platform, subprocess
+import io
+import os
+import zipfile
 from datetime import datetime
 
 import pandas as pd
 import streamlit as st
 
-from exportPPT import MonthlyPerformancePPT  # fixed-columns, quarter-based
+from exportPPT import MonthlyPerformancePPT
 
 
 # -----------------------------
 # Page setup
 # -----------------------------
-st.set_page_config(page_title="Excel → PPT Generator (Quarter)", page_icon="📑", layout="wide")
-st.title("▶️ Generate PPTs from Excel/CSV files (Fixed Columns)")
+st.set_page_config(page_title="Excel → PPT Generator (Quarter, In‑Memory)", page_icon="📑", layout="wide")
+st.title("▶️ Generate PPTs from Excel/CSV (In‑Memory Downloads)")
 
 st.caption(
     "Required columns (exact names): "
-    "`Country`, `Bike_Model`, `Quarter` (e.g., Q1-2025), `Sales Units`, `Revenue_INR` (optional)."
+    "`Country`, `Bike_Model`, `Quarter` (e.g., Q1-2025), `Sales Units`, `Revenue_INR` (optional). "
+    "Nothing is written to disk; download PPTs directly below."
 )
 
 # -----------------------------
-# Sidebar: uploads + output folder
+# Session state
+# -----------------------------
+if "sheet_choices" not in st.session_state:
+    st.session_state.sheet_choices = {}
+
+# Persist generated results across reruns:
+# Each item: (filename: str, blob: bytes)
+if "ppt_results" not in st.session_state:
+    st.session_state.ppt_results = []
+if "ppt_generated_at" not in st.session_state:
+    st.session_state.ppt_generated_at = None
+
+# If uploads change, you may want to clear previous results (optional)
+def clear_results():
+    st.session_state.ppt_results = []
+    st.session_state.ppt_generated_at = None
+
+# -----------------------------
+# Sidebar: uploads
 # -----------------------------
 with st.sidebar:
-    st.header("1) Upload Excel/CSV")
+    st.header("Upload Excel/CSV")
     uploads = st.file_uploader(
         "Upload one or more files",
         type=["xlsx", "xls", "csv"],
-        accept_multiple_files=True
+        accept_multiple_files=True,
+        on_change=clear_results,  # clear old results when new files are chosen
+        key="uploads_widget",
     )
-
-    st.markdown("---")
-    st.header("2) Output PPT Folder")
-    output_dir = st.text_input(
-        "Where should I save PPTX files?",
-        value=os.path.abspath("ppt_output"),
-    )
-    if st.button("🗂️ Ensure folder exists"):
-        os.makedirs(output_dir, exist_ok=True)
-        st.success(f"Ensured folder: {output_dir}")
 
 # -----------------------------
 # Helpers
@@ -81,33 +94,10 @@ def parse_uploaded_file(file, chosen_sheet=None):
     except Exception as e:
         return None, [], False, f"Read error: {e}"
 
-def list_pptx(folder: str) -> list[str]:
-    if not os.path.isdir(folder):
-        return []
-    files = glob.glob(os.path.join(folder, "*.pptx"))
-    files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    return files
-
-def open_locally(path: str):
-    try:
-        sysname = platform.system()
-        if sysname == "Darwin":
-            subprocess.Popen(["open", path])
-        elif sysname == "Windows":
-            os.startfile(path)  # type: ignore[attr-defined]
-        else:
-            subprocess.Popen(["xdg-open", path])
-        st.toast(f"Attempted to open {os.path.basename(path)} locally.")
-    except Exception as e:
-        st.error(f"Could not open locally: {e}")
-
 # -----------------------------
 # 1) Upload previews (right pane)
 # -----------------------------
 st.subheader("1) Uploaded Files Preview")
-
-if "sheet_choices" not in st.session_state:
-    st.session_state.sheet_choices = {}
 
 if not uploads:
     st.info("Upload one or more Excel/CSV files from the sidebar.")
@@ -143,12 +133,12 @@ else:
         st.divider()
 
 # -----------------------------
-# 2) Generate button (no mapping)
+# 2) Generate (in-memory) & persist results
 # -----------------------------
 st.subheader("2) Generate PPTs")
-st.caption("Using the uploaded files (fixed columns), we’ll generate per‑country PowerPoints.")
+st.caption("We’ll combine all uploaded files and generate PPTs in memory. Downloads stay visible after you click them.")
 
-if st.button("🚀 Generate PPTs"):
+if st.button("🚀 Generate PPTs", key="generate_btn"):
     if not uploads:
         st.error("Please upload at least one file.")
     else:
@@ -169,48 +159,55 @@ if st.button("🚀 Generate PPTs"):
             else:
                 combined = pd.concat(dfs, ignore_index=True)
 
-                os.makedirs(output_dir, exist_ok=True)
                 gen = MonthlyPerformancePPT(
-                    output_dir=output_dir,
-                    template_ppt="BAL.pptx",   # or None
-                    logo_path=None,            # optionally set a logo
+                    template_ppt=None,
+                    logo_bytes=None,
                     last_n_quarters=6
                 )
                 try:
-                    out_paths = gen.generate_from_dataframe(combined)
-                    st.success(f"✅ Generated {len(out_paths)} PPTX file(s).")
+                    results = gen.generate_from_dataframe(combined)  # List[(filename, bytes)]
+                    # ✅ Persist results so they survive reruns
+                    st.session_state.ppt_results = results
+                    st.session_state.ppt_generated_at = datetime.now()
+                    st.success(f"✅ Generated {len(results)} PPTX file(s).")
                 except Exception as e:
                     st.error(f"Generation failed: {e}")
-                    out_paths = []
 
-        st.markdown("---")
+st.markdown("---")
 
-        # -----------------------------
-        # 3) PPT folder listing
-        # -----------------------------
-        st.subheader("3) PPT Files in Output Folder")
-        ppt_files = list_pptx(output_dir)
-        if not ppt_files:
-            st.info("No PPTX files found. Check your output folder path in the sidebar.")
-        else:
-            for p in ppt_files:
-                fname = os.path.basename(p)
-                mtime = datetime.fromtimestamp(os.path.getmtime(p)).strftime("%Y-%m-%d %H:%M")
-                size_kb = os.path.getsize(p) // 1024
-                with st.container(border=True):
-                    st.markdown(f"**{fname}**  \n*Modified:* {mtime} • *Size:* {size_kb} KB")
-                    c1, c2 = st.columns([1, 1], vertical_alignment="center")
-                    with c1:
-                        with open(p, "rb") as f:
-                            st.download_button(
-                                label="⬇️ Download PPTX",
-                                data=f.read(),
-                                file_name=fname,
-                                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-                                use_container_width=True,
-                            )
-                    with c2:
-                        if st.button(f"🖥️ Open locally", key=f"open_{fname}"):
-                            open_locally(p)
+# -----------------------------
+# 3) Downloads (read from session_state every run)
+# -----------------------------
+st.subheader("3) Downloads")
+if not st.session_state.ppt_results:
+    st.info("No PPTs generated yet.")
+else:
+    ts = st.session_state.ppt_generated_at.strftime("%Y-%m-%d %H:%M") if st.session_state.ppt_generated_at else "—"
+    st.caption(f"Generated at: {ts}")
 
-st.caption("Note: Quarter must look like Q1-2025 (also accepts 2025Q1, Q2 2024, etc).")
+    # Individual downloads (stable keys so they don't clash)
+    for idx, (fname, blob) in enumerate(st.session_state.ppt_results):
+        st.download_button(
+            label=f"⬇️ {fname}",
+            data=blob,
+            file_name=fname,
+            mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            key=f"dl_{idx}_{fname}",  # stable unique key
+            use_container_width=True,
+        )
+
+    # Zip all
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for fname, blob in st.session_state.ppt_results:
+            zf.writestr(fname, blob)
+    zip_buf.seek(0)
+
+    st.download_button(
+        label="📦 Download All (ZIP)",
+        data=zip_buf,
+        file_name=f"PPTs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+        mime="application/zip",
+        key="dl_zip_all",
+        use_container_width=True,
+    )

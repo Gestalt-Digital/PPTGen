@@ -2,10 +2,11 @@
 
 # pptgen_module.py
 
+import io
 import os
 import re
 from datetime import datetime
-from typing import List, Optional, Iterable
+from typing import List, Optional, Iterable, Tuple
 
 import numpy as np
 import pandas as pd
@@ -19,7 +20,7 @@ COL_COUNTRY    = "Country"
 COL_MODEL      = "Bike_Model"
 COL_QUARTER    = "Quarter"       # values like "Q1-2025", "2025Q1", "Q2 2024"
 COL_UNITS      = "Sales Units"
-COL_REVENUE    = "Revenue_INR"   # numeric
+COL_REVENUE    = "Revenue_INR"   # numeric (optional)
 
 # ----- Quarter parsing helpers -----
 _QUARTER_PATTERNS = [
@@ -62,60 +63,54 @@ class MonthlyPerformancePPT:
     Generate per-country PowerPoints from *quarterly* performance data using fixed column names:
       Country | Bike_Model | Quarter | Sales Units | Revenue_INR
 
-    - Quarter may be 'Q1-2025', '2025Q1', 'Q2 2024', etc.
-    - Revenue_INR is optional; if missing or NaN, revenue KPIs will show '—'.
+    All outputs are returned IN-MEMORY:
+      - generate_from_dataframe(...) -> List[Tuple[filename:str, bytes]]
+      - generate_from_file(...)      -> List[Tuple[filename:str, bytes]]
     """
 
     def __init__(
         self,
-        output_dir: str = "ppt_output",
         template_ppt: Optional[str] = None,
-        logo_path: Optional[str] = None,
+        logo_bytes: Optional[bytes] = None,   # optional logo image bytes
         last_n_quarters: int = 6,
     ):
-        self.output_dir = output_dir
-        self.template_ppt = template_ppt    # e.g., "BAL.pptx"
-        self.logo_path = logo_path          # e.g., "company_logo.png"
+        self.template_ppt = template_ppt
+        self.logo_bytes = logo_bytes
         self.last_n_quarters = max(1, int(last_n_quarters))
 
-        self._ensure_dir(self.output_dir)
-        self._tmp_dir = os.path.join(self.output_dir, "_tmp")
-        self._ensure_dir(self._tmp_dir)
-
-    # ---------- Public API ----------
+    # ---------- Public API (in-memory outputs) ----------
 
     def generate_from_file(
         self,
         input_path: str,
         sheet_name: Optional[str] = None,
-    ) -> List[str]:
+    ) -> List[Tuple[str, bytes]]:
         df = self._read_table(input_path, sheet_name)
         work = self._prepare_dataframe(df)
         return self._generate_all(work)
 
-    def generate_from_dataframe(self, df: pd.DataFrame) -> List[str]:
+    def generate_from_dataframe(self, df: pd.DataFrame) -> List[Tuple[str, bytes]]:
         work = self._prepare_dataframe(df)
         return self._generate_all(work)
 
     # ---------- Core flow ----------
 
-    def _generate_all(self, work: pd.DataFrame) -> List[str]:
+    def _generate_all(self, work: pd.DataFrame) -> List[Tuple[str, bytes]]:
         if work.empty:
             raise ValueError("No rows after preprocessing. Check your input file and required columns.")
 
         latest_q = work["QuarterPeriod"].max()  # pandas Period
         start_q = latest_q - (self.last_n_quarters - 1)
 
-        outputs: List[str] = []
+        outputs: List[Tuple[str, bytes]] = []
         for country, df_c in work.groupby("Country"):
-            out_path = self._generate_for_country(
+            fname, blob = self._generate_for_country(
                 country=country,
                 df_country=df_c.copy(),
                 latest_q=latest_q,
                 start_q=start_q,
             )
-            outputs.append(out_path)
-
+            outputs.append((fname, blob))
         return outputs
 
     def _generate_for_country(
@@ -124,7 +119,7 @@ class MonthlyPerformancePPT:
         df_country: pd.DataFrame,
         latest_q: pd.Period,
         start_q: pd.Period,
-    ) -> str:
+    ) -> Tuple[str, bytes]:
         prs = Presentation(self.template_ppt) if (self.template_ppt and os.path.exists(self.template_ppt)) else Presentation()
 
         # ---- Title slide ----
@@ -136,8 +131,8 @@ class MonthlyPerformancePPT:
                 f"Reporting through: {_period_to_label(latest_q)}\n"
                 f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
             )
-        if self.logo_path and os.path.exists(self.logo_path):
-            self._add_picture(slide, self.logo_path, left=8.5, top=0.2, width=1.5)
+        if self.logo_bytes:
+            self._add_picture_from_bytes(slide, self.logo_bytes, left=8.5, top=0.2, width=1.5)
 
         # ---- KPI slide ----
         self._add_kpi_slide(prs, df_country)
@@ -151,11 +146,12 @@ class MonthlyPerformancePPT:
         # ---- Top-3 model trends ----
         self._add_top_models_slides(prs, df_country, country, top_models, start_q, latest_q)
 
-        # ---- Save deck ----
+        # ---- Save deck to bytes ----
         out_name = f"{country}_Quarterly_Performance_{_period_to_label(latest_q)}.pptx"
-        out_path = os.path.join(self.output_dir, out_name)
-        prs.save(out_path)
-        return out_path
+        buf = io.BytesIO()
+        prs.save(buf)
+        buf.seek(0)
+        return out_name, buf.getvalue()
 
     # ---------- Slides ----------
 
@@ -219,17 +215,17 @@ class MonthlyPerformancePPT:
         x = trend["QuarterPeriod"].apply(_period_to_label)
         y = trend["Sales_Units"]
 
-        plt.figure(figsize=(8, 4))
+        fig = plt.figure(figsize=(8, 4))
         plt.plot(x, y)
         plt.title(f"Quarterly Sales Trend — {country} (Last {self.last_n_quarters} quarters)")
         plt.xlabel("Quarter")
         plt.ylabel("Sales Units")
-        img_trend = os.path.join(self._tmp_dir, f"{country}_trend.png")
-        self._fig_save(img_trend)
+        img_bytes = self._fig_bytes(fig)
+        plt.close(fig)
 
         slide = prs.slides.add_slide(prs.slide_layouts[5])  # Title-only
         slide.shapes.title.text = "Sales Trend"
-        self._add_picture(slide, img_trend, left=0.7, top=1.5, width=8.5)
+        self._add_picture_from_bytes(slide, img_bytes, left=0.7, top=1.5, width=8.5)
 
     def _add_model_mix_slide(self, prs: Presentation, df_c: pd.DataFrame) -> List[str]:
         model_mix_df = (
@@ -258,14 +254,12 @@ class MonthlyPerformancePPT:
         ax.set_ylabel("Units")
         plt.xticks(rotation=30, ha="right")
 
-        chart_path = os.path.join(self._tmp_dir, "model_mix.png")
-        plt.tight_layout()
-        plt.savefig(chart_path, dpi=300)
+        img_bytes = self._fig_bytes(plt.gcf())
         plt.close()
 
         slide = prs.slides.add_slide(prs.slide_layouts[5])
         slide.shapes.title.text = "Model Mix"
-        slide.shapes.add_picture(chart_path, Inches(1), Inches(1.5), width=Inches(8))
+        self._add_picture_from_bytes(slide, img_bytes, left=1.0, top=1.5, width=8.0)
 
         top_models = model_mix_df.head(3)["Model"].tolist()
         return top_models
@@ -292,17 +286,17 @@ class MonthlyPerformancePPT:
             if d.empty:
                 continue
 
-            plt.figure(figsize=(8, 4))
+            fig = plt.figure(figsize=(8, 4))
             plt.plot(d["QuarterPeriod"].apply(_period_to_label), d["Sales_Units"])
             plt.title(f"Model Trend — {m} ({country})")
             plt.xlabel("Quarter")
             plt.ylabel("Sales Units")
-            img = os.path.join(self._tmp_dir, f"{country}_{m}_trend.png")
-            self._fig_save(img)
+            img_bytes = self._fig_bytes(fig)
+            plt.close(fig)
 
             slide = prs.slides.add_slide(prs.slide_layouts[5])
             slide.shapes.title.text = f"Model Trend — {m}"
-            self._add_picture(slide, img, left=0.7, top=1.5, width=8.5)
+            self._add_picture_from_bytes(slide, img_bytes, left=0.7, top=1.5, width=8.5)
 
     # ---------- Data prep ----------
 
@@ -350,11 +344,7 @@ class MonthlyPerformancePPT:
 
         return work
 
-    # ---------- Utils ----------
-
-    @staticmethod
-    def _ensure_dir(p: str) -> None:
-        os.makedirs(p, exist_ok=True)
+    # ---------- Utils (in-memory) ----------
 
     @staticmethod
     def _safe_div(a, b) -> float:
@@ -366,11 +356,16 @@ class MonthlyPerformancePPT:
             return np.nan
 
     @staticmethod
-    def _fig_save(path: str) -> None:
-        plt.tight_layout()
-        plt.savefig(path, dpi=200, bbox_inches="tight")
-        plt.close()
+    def _fig_bytes(fig) -> bytes:
+        """Return a PNG image as bytes from a matplotlib figure."""
+        buf = io.BytesIO()
+        fig.tight_layout()
+        fig.savefig(buf, format="png", dpi=200, bbox_inches="tight")
+        buf.seek(0)
+        return buf.getvalue()
 
     @staticmethod
-    def _add_picture(slide, image_path: str, left: float, top: float, width: float) -> None:
-        slide.shapes.add_picture(image_path, Inches(left), Inches(top), width=Inches(width))
+    def _add_picture_from_bytes(slide, image_bytes: bytes, left: float, top: float, width: float) -> None:
+        """Add an image from bytes to a slide at the given position."""
+        stream = io.BytesIO(image_bytes)
+        slide.shapes.add_picture(stream, Inches(left), Inches(top), width=Inches(width))
