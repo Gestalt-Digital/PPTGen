@@ -8,14 +8,19 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 
-from exportPPT import MonthlyPerformancePPT  # quarter-based generator
+from exportPPT import MonthlyPerformancePPT  # fixed-columns, quarter-based
 
 
 # -----------------------------
 # Page setup
 # -----------------------------
-st.set_page_config(page_title="Excel → PPT Viewer", page_icon="📑", layout="wide")
-st.title("▶️ Generate PPTs from Excel/CSV files (Quarter-based)")
+st.set_page_config(page_title="Excel → PPT Generator (Quarter)", page_icon="📑", layout="wide")
+st.title("▶️ Generate PPTs from Excel/CSV files (Fixed Columns)")
+
+st.caption(
+    "Required columns (exact names): "
+    "`Country`, `Bike_Model`, `Quarter` (e.g., Q1-2025), `Sales Units`, `Revenue_INR` (optional)."
+)
 
 # -----------------------------
 # Sidebar: uploads + output folder
@@ -59,7 +64,6 @@ def parse_uploaded_file(file, chosen_sheet=None):
                 return None, [], False, "No worksheets found."
             sheet_to_use = chosen_sheet if (chosen_sheet in sheets) else sheets[0]
 
-            # Rebuild buffer and parse specific sheet
             bio2 = io.BytesIO(data)
             df = pd.read_excel(bio2, sheet_name=sheet_to_use, engine="openpyxl")
             return df, sheets, True, None
@@ -139,64 +143,17 @@ else:
         st.divider()
 
 # -----------------------------
-# 2) Map Columns (Quarter-based)
+# 2) Generate button (no mapping)
 # -----------------------------
-st.subheader("2) Map Columns")
-st.caption("Pick which columns correspond to Country, Model, Quarter (e.g., 'Q1-2025'), and Units (Revenue/Price optional).")
-
-# Build candidate columns from all uploads
-all_cols = set()
-if uploads:
-    for up in uploads:
-        df0, _, _, err0 = parse_uploaded_file(up)
-        if not err0 and df0 is not None:
-            all_cols.update(df0.columns.tolist())
-all_cols = sorted(all_cols)
-
-def pick(label, required=True, key=None, default=None):
-    opts = ["—"] + all_cols if not required else all_cols
-    index = (opts.index(default) if (default and default in opts) else 0)
-    return st.selectbox(label, opts, index=index, key=key)
-
-# Defaults if present
-default_country = next((c for c in all_cols if c.lower() == "country"), None)
-default_model   = next((c for c in all_cols if "model" in c.lower()), None)
-default_quarter = next((c for c in all_cols if "quarter" in c.lower() or c.lower() in ("qtr","qrtr","period")), None)
-default_units   = next((c for c in all_cols if c.lower() in ("sales units","sales_units","units","sales","qty","quantity")), None)
-default_revenue = next((c for c in all_cols if "revenue" in c.lower() or c.lower() in ("amount","salesvalue")), None)
-default_price   = next((c for c in all_cols if c.lower() in ("unit price","unit_price","price","asp","avg price","average price")), None)
-
-col_country = pick("Country *", required=True,  key="map_country", default=default_country)
-col_model   = pick("Model *",   required=True,  key="map_model",   default=default_model)
-col_quarter = pick("Quarter * (format like Q1-2025)", required=True, key="map_quarter", default=default_quarter)
-col_units   = pick("Units *",   required=True,  key="map_units",   default=default_units)
-col_revenue = pick("Revenue (optional)", required=False, key="map_revenue", default=default_revenue)
-col_price   = pick("Unit Price (optional)", required=False, key="map_price", default=default_price)
-
-column_map = {
-    "country": col_country,
-    "model":   col_model,
-    "quarter": col_quarter,
-    "units":   col_units,
-    "revenue": (None if col_revenue in (None, "—") else col_revenue),
-    "price":   (None if col_price   in (None, "—") else col_price),
-}
-missing_required = [k for k in ("country","model","quarter","units") if not column_map[k] or column_map[k] == "—"]
-
-# -----------------------------
-# 3) Generate button
-# -----------------------------
-st.subheader("3) Generate PPTs")
-st.caption("Using the uploaded files and your column mapping, we’ll generate per‑country PowerPoints.")
+st.subheader("2) Generate PPTs")
+st.caption("Using the uploaded files (fixed columns), we’ll generate per‑country PowerPoints.")
 
 if st.button("🚀 Generate PPTs"):
     if not uploads:
         st.error("Please upload at least one file.")
-    elif missing_required:
-        st.error(f"Please map required columns: {', '.join(missing_required)}")
     else:
         with st.spinner("Generating Country-wise PowerPoints…"):
-            # Combine data
+            # Combine data from all files / selected sheets
             dfs = []
             for up in uploads:
                 sheet_choice = st.session_state.sheet_choices.get(up.name)
@@ -220,7 +177,7 @@ if st.button("🚀 Generate PPTs"):
                     last_n_quarters=6
                 )
                 try:
-                    out_paths = gen.generate_from_dataframe(combined, column_map=column_map)
+                    out_paths = gen.generate_from_dataframe(combined)
                     st.success(f"✅ Generated {len(out_paths)} PPTX file(s).")
                 except Exception as e:
                     st.error(f"Generation failed: {e}")
@@ -229,9 +186,9 @@ if st.button("🚀 Generate PPTs"):
         st.markdown("---")
 
         # -----------------------------
-        # 4) PPT folder listing
+        # 3) PPT folder listing
         # -----------------------------
-        st.subheader("4) PPT Files in Output Folder")
+        st.subheader("3) PPT Files in Output Folder")
         ppt_files = list_pptx(output_dir)
         if not ppt_files:
             st.info("No PPTX files found. Check your output folder path in the sidebar.")
@@ -256,4 +213,4 @@ if st.button("🚀 Generate PPTs"):
                         if st.button(f"🖥️ Open locally", key=f"open_{fname}"):
                             open_locally(p)
 
-st.caption("Tip: Quarter must look like Q1-2025 (case-insensitive). Other variants like '2025Q1' also work.")
+st.caption("Note: Quarter must look like Q1-2025 (also accepts 2025Q1, Q2 2024, etc).")

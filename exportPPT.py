@@ -9,22 +9,27 @@ from typing import List, Optional, Iterable
 
 import numpy as np
 import pandas as pd
-from dateutil.relativedelta import relativedelta
 import matplotlib.pyplot as plt
 from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.dml.color import RGBColor
 
+# ----- Fixed column names (expected EXACTLY as below) -----
+COL_COUNTRY    = "Country"
+COL_MODEL      = "Bike_Model"
+COL_QUARTER    = "Quarter"       # values like "Q1-2025", "2025Q1", "Q2 2024"
+COL_UNITS      = "Sales Units"
+COL_REVENUE    = "Revenue_INR"   # numeric
 
+# ----- Quarter parsing helpers -----
 _QUARTER_PATTERNS = [
     re.compile(r"^\s*Q([1-4])[-\s]?(\d{4})\s*$", re.IGNORECASE),   # Q1-2025 or Q1 2025
     re.compile(r"^\s*(\d{4})[-\s]?Q([1-4])\s*$", re.IGNORECASE),   # 2025-Q1 or 2025 Q1
     re.compile(r"^\s*([1-4])\s*[Qq][-]?\s*(\d{4})\s*$"),           # 1Q-2025 / 1q 2025
 ]
 
-
 def _quarter_to_period(s: str) -> Optional[pd.Period]:
-    """Parse various quarter strings to a pandas Period (Q-DEC). Expecting formats like 'Q1-2025'."""
+    """Parse various quarter strings to a pandas Period (Q-DEC)."""
     if s is None or (isinstance(s, float) and np.isnan(s)):
         return None
     text = str(s).strip()
@@ -37,17 +42,15 @@ def _quarter_to_period(s: str) -> Optional[pd.Period]:
                 year = int(m.group(1)); q = int(m.group(2))
             else:
                 q = int(m.group(1)); year = int(m.group(2))
-            # pandas uses Q-DEC by default; Period(f"{year}Q{q}") is fine.
             try:
                 return pd.Period(f"{year}Q{q}", freq="Q")
             except Exception:
                 return None
-    # Last resort: accept already like '2025Q1'
+    # Accept already-like '2025Q1'
     try:
         return pd.Period(str(text).replace(" ", ""), freq="Q")
     except Exception:
         return None
-
 
 def _period_to_label(p: pd.Period) -> str:
     """Return canonical display like '2025Q1'."""
@@ -56,17 +59,11 @@ def _period_to_label(p: pd.Period) -> str:
 
 class MonthlyPerformancePPT:
     """
-    Generate per-country PowerPoints from *quarterly* performance data.
+    Generate per-country PowerPoints from *quarterly* performance data using fixed column names:
+      Country | Bike_Model | Quarter | Sales Units | Revenue_INR
 
-    Provide a column_map to specify which columns to use:
-      {
-        "country": "<exact col name>",     # required
-        "model":   "<exact col name>",     # required
-        "quarter": "<exact col name>",     # required, values like 'Q1-2025'
-        "units":   "<exact col name>",     # required
-        "revenue": "<exact col name or None>",  # optional
-        "price":   "<exact col name or None>"   # optional
-      }
+    - Quarter may be 'Q1-2025', '2025Q1', 'Q2 2024', etc.
+    - Revenue_INR is optional; if missing or NaN, revenue KPIs will show '—'.
     """
 
     def __init__(
@@ -91,21 +88,20 @@ class MonthlyPerformancePPT:
         self,
         input_path: str,
         sheet_name: Optional[str] = None,
-        column_map: dict | None = None,
     ) -> List[str]:
         df = self._read_table(input_path, sheet_name)
-        work = self._prepare_dataframe(df, column_map=column_map)
+        work = self._prepare_dataframe(df)
         return self._generate_all(work)
 
-    def generate_from_dataframe(self, df: pd.DataFrame, column_map: dict | None = None) -> List[str]:
-        work = self._prepare_dataframe(df, column_map=column_map)
+    def generate_from_dataframe(self, df: pd.DataFrame) -> List[str]:
+        work = self._prepare_dataframe(df)
         return self._generate_all(work)
 
     # ---------- Core flow ----------
 
     def _generate_all(self, work: pd.DataFrame) -> List[str]:
         if work.empty:
-            raise ValueError("No rows after preprocessing. Check your input and column mapping.")
+            raise ValueError("No rows after preprocessing. Check your input file and required columns.")
 
         latest_q = work["QuarterPeriod"].max()  # pandas Period
         start_q = latest_q - (self.last_n_quarters - 1)
@@ -184,7 +180,7 @@ class MonthlyPerformancePPT:
 
         prev_q = latest_q - 1
         prev_units = float(df_c.loc[df_c["QuarterPeriod"] == prev_q, "Sales_Units"].sum())
-        mom_growth = (self._safe_div((last_units - prev_units), prev_units) * 100.0) if prev_units else 0.0
+        qoq_growth = (self._safe_div((last_units - prev_units), prev_units) * 100.0) if prev_units else 0.0
 
         def add_kpi_bullet(label: str, value: str, unit: str = ""):
             p = content.add_paragraph()
@@ -200,9 +196,9 @@ class MonthlyPerformancePPT:
 
         add_kpi_bullet("Latest Quarter", _period_to_label(latest_q))
         add_kpi_bullet("Total Units", f"{last_units:,.0f}")
-        add_kpi_bullet("Revenue", f"{last_rev:,.0f}" if np.isfinite(last_rev) else "—")
-        add_kpi_bullet("Avg Unit Price", f"{avg_price:,.0f}" if np.isfinite(avg_price) else "—")
-        add_kpi_bullet("QoQ Growth (Units)", f"{mom_growth:.1f}", "%")
+        add_kpi_bullet("Revenue (INR)", f"{last_rev:,.0f}" if np.isfinite(last_rev) else "—")
+        add_kpi_bullet("Avg Unit Price (INR)", f"{avg_price:,.0f}" if np.isfinite(avg_price) else "—")
+        add_kpi_bullet("QoQ Growth (Units)", f"{qoq_growth:.1f}", "%")
 
     def _add_trend_slide(
         self,
@@ -220,7 +216,6 @@ class MonthlyPerformancePPT:
         if trend.empty:
             return
 
-        # X labels as strings
         x = trend["QuarterPeriod"].apply(_period_to_label)
         y = trend["Sales_Units"]
 
@@ -317,83 +312,40 @@ class MonthlyPerformancePPT:
             df = pd.read_excel(path, sheet_name=sheet)
         else:
             df = pd.read_csv(path)
-        df.columns = [c.strip().replace("\t", " ") for c in df.columns]
+        df.columns = [str(c) for c in df.columns]  # ensure strings
         return df
 
-    def _prepare_dataframe(self, df: pd.DataFrame, column_map: dict | None = None) -> pd.DataFrame:
-        """
-        column_map (optional):
-          {
-            "country": "<exact col name>",
-            "model": "<exact col name>",
-            "quarter": "<exact col name>",   # values like 'Q1-2025'
-            "units": "<exact col name>",
-            "revenue": "<exact col name or None>",
-            "price": "<exact col name or None>"
-          }
-        """
-        def norm(s: str) -> str:
-            return s.lower().replace(" ", "").replace("_", "")
-
-        cols = list(df.columns)
-
-        if column_map:
-            def _pick(k, required=True):
-                v = column_map.get(k)
-                if required and (not v or v not in cols):
-                    raise KeyError(f"Column map for '{k}' is missing or invalid.")
-                return v if v in cols else None
-
-            col_country = _pick("country", required=True)
-            col_model   = _pick("model",   required=True)
-            col_quarter = _pick("quarter", required=True)
-            col_units   = _pick("units",   required=True)
-            col_revenue = _pick("revenue", required=False)
-            col_price   = _pick("price",   required=False)
-        else:
-            def find_one(candidates: tuple[str, ...]) -> str:
-                for c in cols:
-                    if norm(c) in candidates:
-                        return c
-                raise KeyError(f"Missing required column among: {candidates}")
-
-            def find_optional(candidates: tuple[str, ...]) -> Optional[str]:
-                for c in cols:
-                    if norm(c) in candidates:
-                        return c
-                return None
-
-            col_country = find_one(("country",))
-            col_model   = find_one(("bikemodel", "model", "bikemode", "modelname"))
-            col_quarter = find_one(("quarter", "qtr", "qrtr", "period"))
-            col_units   = find_one(("salesunits", "units", "sales", "qty", "quantity"))
-            col_revenue = find_optional(("revenue", "revenueinr", "amount", "salesvalue"))
-            col_price   = find_optional(("unitprice", "price", "asp", "avgprice", "averageprice"))
+    def _prepare_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
+        # Validate required columns exist exactly
+        required = [COL_COUNTRY, COL_MODEL, COL_QUARTER, COL_UNITS]
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            raise KeyError(f"Missing required columns: {missing}. Expected {required} (and optional '{COL_REVENUE}').")
 
         work = df.copy()
 
-        # ---- Quarter parsing ----
-        qp = work[col_quarter].apply(_quarter_to_period)
+        # Parse Quarter -> Period + canonical text label
+        qp = work[COL_QUARTER].apply(_quarter_to_period)
         work = work.loc[qp.notna()].copy()
         work["QuarterPeriod"] = qp[qp.notna()].astype("period[Q]")
         work["Quarter"] = work["QuarterPeriod"].apply(_period_to_label)
 
-        # Canonical columns
-        work = work.rename(columns={col_country: "Country", col_model: "Model"})
-        work["Sales_Units"] = pd.to_numeric(work[col_units], errors="coerce").fillna(0)
+        # Canonical columns used downstream
+        work = work.rename(columns={
+            COL_COUNTRY: "Country",
+            COL_MODEL:   "Model",
+        })
 
-        if col_revenue:
-            work["Revenue"] = pd.to_numeric(work[col_revenue], errors="coerce")
+        work["Sales_Units"] = pd.to_numeric(work[COL_UNITS], errors="coerce").fillna(0)
+
+        if COL_REVENUE in work.columns:
+            work["Revenue"] = pd.to_numeric(work[COL_REVENUE], errors="coerce")
         else:
             work["Revenue"] = np.nan
 
-        if col_price:
-            work["Unit_Price"] = pd.to_numeric(work[col_price], errors="coerce")
-        else:
-            work["Unit_Price"] = np.nan
-
-        # Derive Unit_Price if missing but Revenue & Units present
-        mask = work["Unit_Price"].isna() & work["Revenue"].notna() & (work["Sales_Units"] > 0)
+        # Derive Unit_Price if Revenue present
+        work["Unit_Price"] = np.nan
+        mask = work["Revenue"].notna() & (work["Sales_Units"] > 0)
         work.loc[mask, "Unit_Price"] = work.loc[mask, "Revenue"] / work.loc[mask, "Sales_Units"]
 
         return work
