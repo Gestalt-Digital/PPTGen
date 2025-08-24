@@ -13,8 +13,3 @@ pyxlsb>=1.0.10        # if you ever have .xlsb
 # Plotting
 matplotlib>=3.9.0
 
-# PowerPoint
-python-pptx>=0.6.23
-
-# Web UI
-streamlit>=1.36.0
