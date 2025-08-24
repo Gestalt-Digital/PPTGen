@@ -1,21 +1,21 @@
 #streamlit run pptgen.py --server.port 8502
 
-import os
-import io
-import time
-import glob
-import platform
-import subprocess
+# app.py
+
+import os, io, glob, platform, subprocess
 from datetime import datetime
 
 import pandas as pd
 import streamlit as st
 
+from exportPPT import MonthlyPerformancePPT  # quarter-based generator
+
+
 # -----------------------------
 # Page setup
 # -----------------------------
 st.set_page_config(page_title="Excel → PPT Viewer", page_icon="📑", layout="wide")
-st.title("▶️ Generate PPTs from excel files")
+st.title("▶️ Generate PPTs from Excel/CSV files (Quarter-based)")
 
 # -----------------------------
 # Sidebar: uploads + output folder
@@ -24,7 +24,7 @@ with st.sidebar:
     st.header("1) Upload Excel/CSV")
     uploads = st.file_uploader(
         "Upload one or more files",
-        type=["xlsx", "csv"],
+        type=["xlsx", "xls", "csv"],
         accept_multiple_files=True
     )
 
@@ -32,11 +32,11 @@ with st.sidebar:
     st.header("2) Output PPT Folder")
     output_dir = st.text_input(
         "Where should I save PPTX files?",
-        value=os.path.abspath("ppt_output"),  # default: ./ppt_output
+        value=os.path.abspath("ppt_output"),
     )
-    # if st.button("🗂️ Ensure folder exists"):
-    #     os.makedirs(output_dir, exist_ok=True)
-    #     st.success(f"Ensured folder: {output_dir}")
+    if st.button("🗂️ Ensure folder exists"):
+        os.makedirs(output_dir, exist_ok=True)
+        st.success(f"Ensured folder: {output_dir}")
 
 # -----------------------------
 # Helpers
@@ -59,14 +59,12 @@ def parse_uploaded_file(file, chosen_sheet=None):
                 return None, [], False, "No worksheets found."
             sheet_to_use = chosen_sheet if (chosen_sheet in sheets) else sheets[0]
 
-            # Rebuild buffer for parsing (ExcelFile may have advanced the pointer)
+            # Rebuild buffer and parse specific sheet
             bio2 = io.BytesIO(data)
-            xl2 = pd.ExcelFile(bio2, engine="openpyxl")
-            df = xl2.parse(sheet_to_use)
+            df = pd.read_excel(bio2, sheet_name=sheet_to_use, engine="openpyxl")
             return df, sheets, True, None
         except Exception as e:
-
-            print(f"Excel parse failed: {type(e).__name__} - {e}")
+            print(f"Excel parse failed for {getattr(file, 'name', '')}: {type(e).__name__} - {e}")
 
             # CSV fallback
             bio.seek(0)
@@ -88,10 +86,10 @@ def list_pptx(folder: str) -> list[str]:
 
 def open_locally(path: str):
     try:
-        sys = platform.system()
-        if sys == "Darwin":
+        sysname = platform.system()
+        if sysname == "Darwin":
             subprocess.Popen(["open", path])
-        elif sys == "Windows":
+        elif sysname == "Windows":
             os.startfile(path)  # type: ignore[attr-defined]
         else:
             subprocess.Popen(["xdg-open", path])
@@ -104,35 +102,36 @@ def open_locally(path: str):
 # -----------------------------
 st.subheader("1) Uploaded Files Preview")
 
+if "sheet_choices" not in st.session_state:
+    st.session_state.sheet_choices = {}
+
 if not uploads:
     st.info("Upload one or more Excel/CSV files from the sidebar.")
 else:
     for i, up in enumerate(uploads):
-        # First parse to discover whether it's Excel and its sheet list
         df0, sheets0, is_excel0, err0 = parse_uploaded_file(up)
         if err0:
             st.error(f"**{up.name}** — {err0}")
+            st.divider()
             continue
 
         st.markdown(f"**File:** {up.name}")
         if is_excel0 and sheets0:
-            # Per-file sheet picker (unique key)
+            default_sheet = st.session_state.sheet_choices.get(up.name, sheets0[0])
             chosen = st.selectbox(
                 f"Worksheet for {up.name}",
                 sheets0,
-                index=0,
+                index=(sheets0.index(default_sheet) if default_sheet in sheets0 else 0),
                 key=f"sheet_{up.name}_{i}",
             )
+            st.session_state.sheet_choices[up.name] = chosen
             df, sheets, is_excel, err = parse_uploaded_file(up, chosen_sheet=chosen)
         else:
-            # CSV or non-Excel — no sheet picker
             df, sheets, is_excel, err = df0, sheets0, is_excel0, err0
 
         if err:
             st.error(f"{err}")
-            continue
-
-        if df is None or df.empty:
+        elif df is None or df.empty:
             st.info("No rows to display.")
         else:
             st.dataframe(df.head(50), use_container_width=True, height=320)
@@ -140,46 +139,121 @@ else:
         st.divider()
 
 # -----------------------------
-# 2) Generate button (spinner only)
+# 2) Map Columns (Quarter-based)
 # -----------------------------
-st.subheader("2) Generate PPTs")
-st.caption("Using the excel files uploaded, I am generating the export performance PPTs by country..please wait!")
+st.subheader("2) Map Columns")
+st.caption("Pick which columns correspond to Country, Model, Quarter (e.g., 'Q1-2025'), and Units (Revenue/Price optional).")
+
+# Build candidate columns from all uploads
+all_cols = set()
+if uploads:
+    for up in uploads:
+        df0, _, _, err0 = parse_uploaded_file(up)
+        if not err0 and df0 is not None:
+            all_cols.update(df0.columns.tolist())
+all_cols = sorted(all_cols)
+
+def pick(label, required=True, key=None, default=None):
+    opts = ["—"] + all_cols if not required else all_cols
+    index = (opts.index(default) if (default and default in opts) else 0)
+    return st.selectbox(label, opts, index=index, key=key)
+
+# Defaults if present
+default_country = next((c for c in all_cols if c.lower() == "country"), None)
+default_model   = next((c for c in all_cols if "model" in c.lower()), None)
+default_quarter = next((c for c in all_cols if "quarter" in c.lower() or c.lower() in ("qtr","qrtr","period")), None)
+default_units   = next((c for c in all_cols if c.lower() in ("sales units","sales_units","units","sales","qty","quantity")), None)
+default_revenue = next((c for c in all_cols if "revenue" in c.lower() or c.lower() in ("amount","salesvalue")), None)
+default_price   = next((c for c in all_cols if c.lower() in ("unit price","unit_price","price","asp","avg price","average price")), None)
+
+col_country = pick("Country *", required=True,  key="map_country", default=default_country)
+col_model   = pick("Model *",   required=True,  key="map_model",   default=default_model)
+col_quarter = pick("Quarter * (format like Q1-2025)", required=True, key="map_quarter", default=default_quarter)
+col_units   = pick("Units *",   required=True,  key="map_units",   default=default_units)
+col_revenue = pick("Revenue (optional)", required=False, key="map_revenue", default=default_revenue)
+col_price   = pick("Unit Price (optional)", required=False, key="map_price", default=default_price)
+
+column_map = {
+    "country": col_country,
+    "model":   col_model,
+    "quarter": col_quarter,
+    "units":   col_units,
+    "revenue": (None if col_revenue in (None, "—") else col_revenue),
+    "price":   (None if col_price   in (None, "—") else col_price),
+}
+missing_required = [k for k in ("country","model","quarter","units") if not column_map[k] or column_map[k] == "—"]
+
+# -----------------------------
+# 3) Generate button
+# -----------------------------
+st.subheader("3) Generate PPTs")
+st.caption("Using the uploaded files and your column mapping, we’ll generate per‑country PowerPoints.")
 
 if st.button("🚀 Generate PPTs"):
-    with st.spinner("Generating Country-wise PowerPoints…"):
-        time.sleep(3)  # simulate work
-    st.success("Done! Listing PPTs below from your output folder.")
-
-    st.markdown("---")
-
-    # -----------------------------
-    # 3) PPT folder listing
-    # -----------------------------
-    st.subheader("3) PPT Files in Output Folder")
-    ppt_files = list_pptx(output_dir)
-    
-    if not ppt_files:
-        st.info("No PPTX files found. Point to your folder in the sidebar or ensure it exists.")
+    if not uploads:
+        st.error("Please upload at least one file.")
+    elif missing_required:
+        st.error(f"Please map required columns: {', '.join(missing_required)}")
     else:
-        for p in ppt_files:
-            fname = os.path.basename(p)
-            mtime = datetime.fromtimestamp(os.path.getmtime(p)).strftime("%Y-%m-%d %H:%M")
-            size_kb = os.path.getsize(p) // 1024
-    
-            with st.container(border=True):
-                st.markdown(f"**{fname}**  \n*Modified:* {mtime} • *Size:* {size_kb} KB")
-                c1, c2 = st.columns([1, 1], vertical_alignment="center")
-                with c1:
-                    with open(p, "rb") as f:
-                        st.download_button(
-                            label="⬇️ Download PPTX",
-                            data=f.read(),
-                            file_name=fname,
-                            mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-                            use_container_width=True,
-                        )
-                with c2:
-                    if st.button(f"🖥️ Open locally", key=f"open_{fname}"):
-                        open_locally(p)
+        with st.spinner("Generating Country-wise PowerPoints…"):
+            # Combine data
+            dfs = []
+            for up in uploads:
+                sheet_choice = st.session_state.sheet_choices.get(up.name)
+                df, _, _, err = parse_uploaded_file(up, chosen_sheet=sheet_choice)
+                if err:
+                    st.error(f"{up.name} — {err}")
+                    continue
+                if df is not None and not df.empty:
+                    dfs.append(df)
 
-st.caption("Tip: If your script writes to a different folder, just change the path in the sidebar.")
+            if not dfs:
+                st.error("No valid data found in the uploaded files.")
+            else:
+                combined = pd.concat(dfs, ignore_index=True)
+
+                os.makedirs(output_dir, exist_ok=True)
+                gen = MonthlyPerformancePPT(
+                    output_dir=output_dir,
+                    template_ppt="BAL.pptx",   # or None
+                    logo_path=None,            # optionally set a logo
+                    last_n_quarters=6
+                )
+                try:
+                    out_paths = gen.generate_from_dataframe(combined, column_map=column_map)
+                    st.success(f"✅ Generated {len(out_paths)} PPTX file(s).")
+                except Exception as e:
+                    st.error(f"Generation failed: {e}")
+                    out_paths = []
+
+        st.markdown("---")
+
+        # -----------------------------
+        # 4) PPT folder listing
+        # -----------------------------
+        st.subheader("4) PPT Files in Output Folder")
+        ppt_files = list_pptx(output_dir)
+        if not ppt_files:
+            st.info("No PPTX files found. Check your output folder path in the sidebar.")
+        else:
+            for p in ppt_files:
+                fname = os.path.basename(p)
+                mtime = datetime.fromtimestamp(os.path.getmtime(p)).strftime("%Y-%m-%d %H:%M")
+                size_kb = os.path.getsize(p) // 1024
+                with st.container(border=True):
+                    st.markdown(f"**{fname}**  \n*Modified:* {mtime} • *Size:* {size_kb} KB")
+                    c1, c2 = st.columns([1, 1], vertical_alignment="center")
+                    with c1:
+                        with open(p, "rb") as f:
+                            st.download_button(
+                                label="⬇️ Download PPTX",
+                                data=f.read(),
+                                file_name=fname,
+                                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                                use_container_width=True,
+                            )
+                    with c2:
+                        if st.button(f"🖥️ Open locally", key=f"open_{fname}"):
+                            open_locally(p)
+
+st.caption("Tip: Quarter must look like Q1-2025 (case-insensitive). Other variants like '2025Q1' also work.")
