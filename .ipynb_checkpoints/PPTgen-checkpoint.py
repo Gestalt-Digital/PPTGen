@@ -64,10 +64,7 @@ def parse_uploaded_file(file, chosen_sheet=None):
             xl2 = pd.ExcelFile(bio2, engine="openpyxl")
             df = xl2.parse(sheet_to_use)
             return df, sheets, True, None
-        except Exception as e:
-
-            print(f"Excel parse failed: {type(e).__name__} - {e}")
-
+        except Exception:
             # CSV fallback
             bio.seek(0)
             try:
