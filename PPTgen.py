@@ -11,6 +11,9 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 
+st.set_option("server.fileWatcherType", "poll")
+
+
 # -----------------------------
 # Page setup
 # -----------------------------
@@ -64,7 +67,10 @@ def parse_uploaded_file(file, chosen_sheet=None):
             xl2 = pd.ExcelFile(bio2, engine="openpyxl")
             df = xl2.parse(sheet_to_use)
             return df, sheets, True, None
-        except Exception:
+        except Exception as e:
+
+            print(f"Excel parse failed: {type(e).__name__} - {e}")
+
             # CSV fallback
             bio.seek(0)
             try:
