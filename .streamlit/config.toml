@@ -1,0 +1,4 @@
+[server]
+fileWatcherType = "poll"
+# optional, but handy if your tree grows:
+# folderWatchBlacklist = ["venv",".venv",".git","node_modules","__pycache__","data","ppt_output","logs","dist","build"]
